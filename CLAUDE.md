@@ -13,9 +13,9 @@ The language of output to the screen, during processing, and display of processi
 If individual support is required
 - `CLAUDE.md`
   - In English
-  - Create a file translated into Japanese as `CLAUDE_jp.md`
-  - If changes are made to CLAUDE.md, translate the changes into Japanese and reflect them in CLAUDE_jp.md
-- `CLAUDE_jp.md`
+  - Create a file translated into Japanese as `CLAUDE.ja.md`
+  - If changes are made to CLAUDE.md, translate the changes into Japanese and reflect them in CLAUDE.ja.md
+- `CLAUDE.ja.md`
   - The Japanese translation file is for user reference only and is not used in the context of execution.
   - If there are additional changes other than those reflected in CLAUDE.md, ask the user how to respond to each part.
     - Response options
@@ -25,7 +25,7 @@ If individual support is required
 
 ## Formatting Markdown files
 
-- If a file name, absolute path, or relative path is written in the text, use code notation, such as `CLAUDE_jp.md`, especially for file paths within a project.
+- If a file name, absolute path, or relative path is written in the text, use code notation, such as `CLAUDE.ja.md`, especially for file paths within a project.
 
 ## Common Commands
 
