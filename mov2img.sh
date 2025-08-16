@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========================================
+# 画面録画から静止画を自動抽出するスクリプト
+# ========================================
+# 用途：iPhone/iPad/macOSの画面録画動画から、
+#       画面が静止した瞬間の画像を自動で抽出して
+#       操作手順書用の静止画ファイルを作成する
+# ========================================
+
+# デフォルト設定値
+DEFAULT_THRESHOLD="0.03"    # 3%の差分閾値（デフォルト）
+DEFAULT_FPS="30"            # 処理フレームレート（デフォルト）
+DEFAULT_STATIC_DURATION="1.0"  # 静止判定の最小時間（秒）
+
+# グローバル変数
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMP_DIR="${SCRIPT_DIR}/temp"
+VERBOSE=false
+
+# ========================================
+# 終了時の後始末処理
+# ========================================
+cleanup() {
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# ========================================
+# 使用方法の表示
+# ========================================
+usage() {
+    cat << EOF
+使用方法: $0 [オプション] -i 入力ファイル
+
+画面録画動画から、静止した瞬間の画像を自動抽出します。
+
+必須パラメータ:
+  -i, --input ファイル      入力動画ファイル (.mov/.mp4)
+
+オプション:
+  -o, --output フォルダ     出力フォルダ (省略時: 入力ファイル名)
+  -n, --name プレフィックス 画像ファイル名のベース (省略時: 出力フォルダ名)
+  -t, --threshold パーセント 差分閾値パーセント (省略時: 3%)
+  -f, --fps レート          処理フレームレート (省略時: 30)
+  -d, --duration 秒         静止判定の最小時間 (省略時: 1.0秒)
+  -v, --verbose            詳細出力を有効にする
+  -h, --help              この説明を表示
+
+使用例:
+  $0 -i recording.mov
+  $0 -i recording.mp4 -o frames -n screenshot -t 5 -f 15
+  $0 -i tutorial.mov -t 2 -d 0.5 -v
+EOF
+}
+
+# ========================================
+# コマンドライン引数の解析
+# ========================================
+parse_args() {
+    local input_file=""
+    local output_dir=""
+    local base_name=""
+    local threshold="$DEFAULT_THRESHOLD"
+    local fps="$DEFAULT_FPS"
+    local min_duration="$DEFAULT_STATIC_DURATION"
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -i|--input)
+                input_file="$2"
+                shift 2
+                ;;
+            -o|--output)
+                output_dir="$2"
+                shift 2
+                ;;
+            -n|--name)
+                base_name="$2"
+                shift 2
+                ;;
+            -t|--threshold)
+                threshold="$2"
+                shift 2
+                ;;
+            -f|--fps)
+                fps="$2"
+                shift 2
+                ;;
+            -d|--duration)
+                min_duration="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "エラー: 不明なパラメータ $1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # 必須パラメータの確認
+    if [[ -z "$input_file" ]]; then
+        echo "エラー: 入力ファイルが指定されていません" >&2
+        usage
+        exit 1
+    fi
+    
+    # デフォルト値の設定
+    if [[ -z "$output_dir" ]]; then
+        output_dir="$(basename "$input_file" | sed 's/\.[^.]*$//')_frames"
+    fi
+    
+    if [[ -z "$base_name" ]]; then
+        base_name="$(basename "$output_dir")"
+    fi
+    
+    # 他の関数で使用するため変数をエクスポート
+    export INPUT_FILE="$input_file"
+    export OUTPUT_DIR="$output_dir"
+    export BASE_NAME="$base_name"
+    export THRESHOLD="$threshold"
+    export FPS="$fps"
+    export MIN_DURATION="$min_duration"
+}
+
+# ========================================
+# 環境確認と入力ファイルの検証
+# ========================================
+validate_environment() {
+    # 入力ファイルの存在確認
+    if [[ ! -f "$INPUT_FILE" ]]; then
+        echo "エラー: 入力ファイル '$INPUT_FILE' が見つかりません" >&2
+        exit 1
+    fi
+    
+    # 入力ファイルが動画ファイルかどうか確認
+    local mime_type
+    mime_type=$(file -b --mime-type "$INPUT_FILE" 2>/dev/null || echo "unknown")
+    if [[ ! "$mime_type" =~ ^video/ ]]; then
+        echo "エラー: '$INPUT_FILE' は動画ファイルではありません (検出タイプ: $mime_type)" >&2
+        exit 1
+    fi
+    
+    # ffmpegが利用可能か確認
+    if ! command -v ffmpeg &> /dev/null; then
+        echo "エラー: ffmpegが見つかりません。次のコマンドでインストールしてください: brew install ffmpeg" >&2
+        exit 1
+    fi
+    
+    # ffprobeが利用可能か確認
+    if ! command -v ffprobe &> /dev/null; then
+        echo "エラー: ffprobeが見つかりません。次のコマンドでインストールしてください: brew install ffmpeg" >&2
+        exit 1
+    fi
+}
+
+# ========================================
+# 出力フォルダの準備
+# ========================================
+setup_output_directory() {
+    if [[ ! -d "$OUTPUT_DIR" ]]; then
+        mkdir -p "$OUTPUT_DIR" || {
+            echo "エラー: 出力フォルダ '$OUTPUT_DIR' を作成できません" >&2
+            exit 1
+        }
+    fi
+    
+    if [[ ! -w "$OUTPUT_DIR" ]]; then
+        echo "エラー: 出力フォルダ '$OUTPUT_DIR' に書き込み権限がありません" >&2
+        exit 1
+    fi
+}
+
+# ========================================
+# ログ出力関数（詳細モード時のみ）
+# ========================================
+log() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "[$(date '+%H:%M:%S')] $*" >&2
+    fi
+}
+
+# ========================================
+# 静止画像の抽出メイン処理
+# ========================================
+extract_static_frames() {
+    local input="$1"
+    local output_dir="$2" 
+    local base_name="$3"
+    local threshold="$4"
+    local fps="$5"
+    local min_duration="$6"
+    
+    log "フレーム抽出を開始: $input"
+    log "パラメータ: 閾値=$threshold, FPS=$fps, 最小静止時間=$min_duration"
+    
+    # 一時フォルダの作成
+    mkdir -p "$TEMP_DIR" || {
+        echo "エラー: 一時フォルダ '$TEMP_DIR' を作成できません" >&2
+        return 1
+    }
+    
+    # 環境変数を一時フォルダに export
+    # TEMP_DIR=$(mktemp -d -t "frame_extractor_$$_XXXXXX")
+    # chmod 700 "$TEMP_DIR"
+    
+    # 静止判定に必要な最小フレーム数を計算
+    local min_frames
+    min_frames=$(echo "$fps * $min_duration" | bc -l | cut -d. -f1)
+    
+    log "指定されたFPSでフレームを抽出中..."
+    
+    # ステップ1: 指定されたFPSでフレーム抽出
+    ffmpeg -i "$input" \
+        -vf "fps=$fps" \
+        -q:v 2 \
+        -pix_fmt yuv420p \
+        "$TEMP_DIR/frame_%08d.png" \
+        2>/dev/null
+    
+    # ステップ2: 抽出されたフレームの解析
+    local frame_files=("$TEMP_DIR"/frame_*.png)
+    local total_frames=${#frame_files[@]}
+    
+    if [[ $total_frames -eq 0 ]]; then
+        echo "エラー: 動画からフレームを抽出できませんでした" >&2
+        return 1
+    fi
+    
+    log "静止期間の解析中: $total_frames フレーム"
+    
+    # ステップ3: 連続フレーム比較と静止期間の特定
+    local static_start=""        # 静止期間の開始フレーム番号
+    local static_count=0         # 連続静止フレーム数
+    local extracted_count=0      # 抽出した画像の数
+    
+    echo "フレーム解析中..." >&2
+    
+    for ((i=0; i<total_frames-1; i++)); do
+        local current_frame="${frame_files[i]}"
+        local next_frame="${frame_files[i+1]}"
+        
+        # ffmpegを使ってフレーム間の差分を計算
+        local diff_score
+        diff_score=$(ffmpeg -i "$current_frame" -i "$next_frame" \
+            -filter_complex "[0:v][1:v]blend=all_mode=difference,blackframe=amount=0:threshold=32" \
+            -f null - 2>&1 | grep -o "blackframe.*" | head -1 | grep -o "pblack:[0-9.]*" | cut -d: -f2 || echo "0")
+        
+        # 差分が閾値以下なら静止フレームと判定
+        if (( $(echo "$diff_score < $threshold" | bc -l) )); then
+            if [[ -z "$static_start" ]]; then
+                static_start="$i"
+                static_count=1
+            else
+                ((static_count++))
+            fi
+        else
+            # 静止期間の終了
+            if [[ -n "$static_start" && $static_count -ge $min_frames ]]; then
+                # 静止期間の中央フレームを抽出
+                local middle_frame_idx=$((static_start + static_count / 2))
+                local source_frame="${frame_files[middle_frame_idx]}"
+                local output_frame="$output_dir/${base_name}_$(printf '%04d' $((++extracted_count))).png"
+                
+                cp "$source_frame" "$output_frame"
+                log "静止画像を抽出: $output_frame (静止期間: $static_count フレーム)"
+            fi
+            
+            # 静止期間のリセット
+            static_start=""
+            static_count=0
+        fi
+        
+        # 進行状況表示
+        if [[ $((i % 30)) -eq 0 ]]; then
+            local progress=$((i * 100 / total_frames))
+            echo -ne "\r進行状況: $progress% ($i/$total_frames フレーム解析済み)" >&2
+        fi
+    done
+    
+    # 最後の静止期間の処理
+    if [[ -n "$static_start" && $static_count -ge $min_frames ]]; then
+        local middle_frame_idx=$((static_start + static_count / 2))
+        local source_frame="${frame_files[middle_frame_idx]}"
+        local output_frame="$output_dir/${base_name}_$(printf '%04d' $((++extracted_count))).png"
+        
+        cp "$source_frame" "$output_frame"
+        log "最終静止画像を抽出: $output_frame"
+    fi
+    
+    echo -ne "\r" >&2
+    echo "抽出完了。$extracted_count 個の静止画像を見つけました。" >&2
+    
+    return 0
+}
+
+# ========================================
+# メイン実行関数
+# ========================================
+main() {
+    parse_args "$@"
+    validate_environment
+    setup_output_directory
+    
+    log "設定確認:"
+    log "  入力ファイル: $INPUT_FILE"
+    log "  出力フォルダ: $OUTPUT_DIR"
+    log "  ベース名: $BASE_NAME"
+    log "  差分閾値: $THRESHOLD%"
+    log "  処理FPS: $FPS"
+    log "  最小静止時間: $MIN_DURATION 秒"
+    
+    extract_static_frames "$INPUT_FILE" "$OUTPUT_DIR" "$BASE_NAME" "$THRESHOLD" "$FPS" "$MIN_DURATION"
+}
+
+# ========================================
+# スクリプト実行開始
+# ========================================
+main "$@"

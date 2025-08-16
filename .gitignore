@@ -1,0 +1,9 @@
+.envrc
+.code/
+.idea/
+.claude/
+
+.vscode/
+
+src_mov/
+*_frames/
