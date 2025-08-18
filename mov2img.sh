@@ -22,12 +22,12 @@ VERBOSE=false
 # ========================================
 # 終了時の後始末処理
 # ========================================
-cleanup() {
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-        rm -rf "$TEMP_DIR"
-    fi
-}
-trap cleanup EXIT INT TERM
+# cleanup() {
+#     if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+#         rm -rf "$TEMP_DIR"
+#     fi
+# }
+# trap cleanup EXIT INT TERM
 
 # ========================================
 # 使用方法の表示
@@ -167,6 +167,126 @@ validate_environment() {
 }
 
 # ========================================
+# 動画情報の取得と解析
+# ========================================
+analyze_video() {
+    local input_file="$1"
+    
+    # 動画の基本情報を取得
+    local duration
+    duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | cut -d. -f1)
+    
+    local fps
+    fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | bc -l 2>/dev/null | cut -d. -f1)
+    
+    local width
+    width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    
+    local height
+    height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    
+    local codec
+    codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    
+    # 動画情報をエクスポート
+    export VIDEO_DURATION="${duration:-0}"
+    export VIDEO_FPS="${fps:-30}"
+    export VIDEO_WIDTH="${width:-0}"
+    export VIDEO_HEIGHT="${height:-0}"
+    export VIDEO_CODEC="${codec:-unknown}"
+}
+
+# ========================================
+# 推奨設定の表示
+# ========================================
+show_recommendations() {
+    echo ""
+    echo "========================================" >&2
+    echo "📹 動画情報の解析結果" >&2
+    echo "========================================" >&2
+    echo "ファイル名: $(basename "$INPUT_FILE")" >&2
+    echo "動画時間: ${VIDEO_DURATION}秒" >&2
+    echo "解像度: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}" >&2
+    echo "フレームレート: ${VIDEO_FPS} fps" >&2
+    echo "コーデック: ${VIDEO_CODEC}" >&2
+    echo "" >&2
+    
+    echo "========================================" >&2
+    echo "⚙️  推奨設定" >&2
+    echo "========================================" >&2
+    
+    # 動画の長さに基づく推奨設定
+    local recommended_fps="$FPS"
+    local recommended_threshold="$THRESHOLD"
+    local recommended_duration="$MIN_DURATION"
+    
+    if [[ $VIDEO_DURATION -gt 600 ]]; then
+        # 10分以上の長い動画
+        recommended_fps="15"
+        echo "📌 長時間動画（10分以上）の推奨設定:" >&2
+        echo "   - 処理FPS: 15 (処理時間短縮のため)" >&2
+        echo "   - 閾値: 3-5% (重要な変化のみ検出)" >&2
+        echo "   - 静止時間: 1.5秒以上" >&2
+    elif [[ $VIDEO_DURATION -gt 180 ]]; then
+        # 3-10分の中程度の動画
+        recommended_fps="20"
+        echo "📌 中程度の動画（3-10分）の推奨設定:" >&2
+        echo "   - 処理FPS: 20" >&2
+        echo "   - 閾値: 3% (標準的な設定)" >&2
+        echo "   - 静止時間: 1.0秒" >&2
+    else
+        # 3分未満の短い動画
+        recommended_fps="30"
+        echo "📌 短い動画（3分未満）の推奨設定:" >&2
+        echo "   - 処理FPS: 30 (詳細な検出)" >&2
+        echo "   - 閾値: 2% (細かい変化も検出)" >&2
+        echo "   - 静止時間: 0.5-1.0秒" >&2
+    fi
+    
+    # 解像度に基づく推奨
+    if [[ $VIDEO_WIDTH -gt 1920 ]]; then
+        echo "" >&2
+        echo "⚠️  高解像度動画の注意点:" >&2
+        echo "   - 処理に時間がかかる可能性があります" >&2
+        echo "   - 必要に応じてFPSを下げることを検討してください" >&2
+    fi
+    
+    echo "" >&2
+    echo "========================================" >&2
+    echo "📊 現在の設定" >&2
+    echo "========================================" >&2
+    echo "出力フォルダ: $OUTPUT_DIR" >&2
+    echo "ファイル名プレフィックス: $BASE_NAME" >&2
+    echo "処理FPS: $FPS" >&2
+    echo "差分閾値: $THRESHOLD%" >&2
+    echo "最小静止時間: $MIN_DURATION秒" >&2
+    echo "" >&2
+    
+    # 処理時間の目安を計算
+    local estimated_frames=$((VIDEO_DURATION * FPS))
+    local estimated_time=$((estimated_frames / 30))  # 概算：30フレーム/秒で処理
+    
+    echo "⏱️  処理時間の目安: 約${estimated_time}秒" >&2
+    echo "" >&2
+}
+
+# ========================================
+# 処理実行の確認
+# ========================================
+confirm_execution() {
+    echo "上記の設定で処理を開始しますか？ [Y/n]: " >&2
+    read -r response
+    
+    # デフォルトはYes
+    if [[ -z "$response" ]] || [[ "$response" =~ ^[Yy]$ ]]; then
+        return 0
+    else
+        echo "処理をキャンセルしました。" >&2
+        exit 0
+    fi
+}
+
+# ========================================
 # 出力フォルダの準備
 # ========================================
 setup_output_directory() {
@@ -222,6 +342,8 @@ extract_static_frames() {
     
     log "指定されたFPSでフレームを抽出中..."
     
+    ffprobe -i "$input"
+
     # ステップ1: 指定されたFPSでフレーム抽出
     ffmpeg -i "$input" \
         -vf "fps=$fps" \
