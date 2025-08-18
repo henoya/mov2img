@@ -340,17 +340,50 @@ extract_static_frames() {
     local min_frames
     min_frames=$(echo "$fps * $min_duration" | bc -l | cut -d. -f1)
     
+    # 動画情報から抽出予定のフレーム数を計算
+    local video_duration
+    video_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null || echo "0")
+    
+    local estimated_frames
+    estimated_frames=$(echo "$video_duration * $fps" | bc -l | cut -d. -f1)
+    
+    echo "========================================" >&2
+    echo "📊 フレーム抽出情報" >&2
+    echo "========================================" >&2
+    echo "動画の長さ: ${video_duration}秒" >&2
+    echo "処理FPS: ${fps} fps" >&2
+    echo "抽出予定フレーム数: 約${estimated_frames}枚" >&2
+    echo "一時保存先: ${TEMP_DIR}/" >&2
+    echo "========================================" >&2
+    echo "" >&2
+    
     log "指定されたFPSでフレームを抽出中..."
     
-    ffprobe -i "$input"
-
-    # ステップ1: 指定されたFPSでフレーム抽出
+    # ステップ1: 指定されたFPSでフレーム抽出（進捗表示付き）
+    echo "フレーム抽出を開始しています..." >&2
+    
+    # ffmpegをバックグラウンドで実行し、進捗を監視
     ffmpeg -i "$input" \
         -vf "fps=$fps" \
         -q:v 2 \
         -pix_fmt yuv420p \
-        "$TEMP_DIR/frame_%08d.png" \
-        2>/dev/null
+        -progress pipe:1 \
+        "$TEMP_DIR/frame_%08d.png" 2>/dev/null | \
+    while IFS='=' read -r key value; do
+        if [[ "$key" == "frame" ]]; then
+            # 現在のフレーム番号を取得
+            local current_frame="$value"
+            local progress_percent=$(echo "scale=1; $current_frame * 100 / $estimated_frames" | bc -l 2>/dev/null || echo "0")
+            
+            # 10フレームごとに進捗を更新
+            if [[ $((current_frame % 10)) -eq 0 ]]; then
+                echo -ne "\r抽出中: $current_frame / $estimated_frames フレーム (${progress_percent}%)" >&2
+            fi
+        fi
+    done
+    
+    echo -ne "\r" >&2
+    echo "フレーム抽出完了" >&2
     
     # ステップ2: 抽出されたフレームの解析
     local frame_files=("$TEMP_DIR"/frame_*.png)
@@ -380,11 +413,19 @@ extract_static_frames() {
             -filter_complex "[0:v][1:v]blend=all_mode=difference,blackframe=amount=0:threshold=32" \
             -f null - 2>&1 | grep -o "blackframe.*" | head -1 | grep -o "pblack:[0-9.]*" | cut -d: -f2 || echo "0")
         
+        # Verboseモードでは差分スコアを表示
+        if [[ "$VERBOSE" == "true" ]]; then
+            local frame_num=$(printf "%04d" $((i+1)))
+            local next_num=$(printf "%04d" $((i+2)))
+            log "フレーム $frame_num → $next_num: 差分スコア=$diff_score% (閾値=$threshold%)"
+        fi
+        
         # 差分が閾値以下なら静止フレームと判定
         if (( $(echo "$diff_score < $threshold" | bc -l) )); then
             if [[ -z "$static_start" ]]; then
                 static_start="$i"
                 static_count=1
+                log "静止期間開始: フレーム $(printf "%04d" $((i+1)))"
             else
                 ((static_count++))
             fi
@@ -398,6 +439,13 @@ extract_static_frames() {
                 
                 cp "$source_frame" "$output_frame"
                 log "静止画像を抽出: $output_frame (静止期間: $static_count フレーム)"
+                
+                if [[ "$VERBOSE" == "true" ]]; then
+                    echo "  → 静止期間: フレーム $(printf "%04d" $((static_start+1))) から $(printf "%04d" $((i+1))) まで ($static_count フレーム)" >&2
+                    echo "  → 中央フレーム $(printf "%04d" $((middle_frame_idx+1))) を抽出" >&2
+                fi
+            elif [[ -n "$static_start" ]]; then
+                log "静止期間終了: フレーム $(printf "%04d" $((i+1))) (期間: $static_count フレーム < 最小: $min_frames フレーム)"
             fi
             
             # 静止期間のリセット
