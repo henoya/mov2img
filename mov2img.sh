@@ -510,10 +510,13 @@ extract_static_frames() {
             fi
         else
             # 静止期間の終了
+            log "静止期間終了を検出: static_start=$static_start, static_count=$static_count, min_frames=$min_frames"
             if [[ -n "$static_start" && $static_count -ge $min_frames ]]; then
+                log "静止期間抽出条件を満たしています。処理開始..."
                 # 静止期間の中央フレームを抽出
                 local middle_frame_idx=$((static_start + static_count / 2))
                 local source_frame="${frame_files[middle_frame_idx]}"
+                log "中央フレーム計算: middle_frame_idx=$middle_frame_idx, source_frame=$source_frame"
                 
                 # ソースフレームの存在確認
                 if [[ ! -f "$source_frame" ]]; then
@@ -522,15 +525,21 @@ extract_static_frames() {
                     static_count=0
                     continue
                 fi
+                log "ソースフレーム確認完了: $source_frame"
                 
-                ((extracted_count++))
+                log "extracted_count更新前: $extracted_count"
+                extracted_count=$((extracted_count + 1))
+                log "extracted_count更新後: $extracted_count"
                 local output_frame="$output_dir/${base_name}_$(printf '%04d' $extracted_count).png"
+                log "出力ファイル名決定: $output_frame"
                 
                 # ファイルコピーをエラーハンドリング付きで実行
+                log "ファイルコピー開始..."
                 set +e
                 cp "$source_frame" "$output_frame"
                 local cp_status=$?
                 set -e
+                log "ファイルコピー完了: 終了コード=$cp_status"
                 
                 if [[ $cp_status -eq 0 ]]; then
                     log "静止画像を抽出: $output_frame (静止期間: $static_count フレーム)"
@@ -541,8 +550,9 @@ extract_static_frames() {
                     fi
                 else
                     log "エラー: ファイルコピーに失敗しました: $source_frame → $output_frame (終了コード: $cp_status)"
-                    ((extracted_count--))  # カウントを戻す
+                    extracted_count=$((extracted_count - 1))  # カウントを戻す
                 fi
+                log "静止期間抽出処理完了"
             elif [[ -n "$static_start" ]]; then
                 log "静止期間終了: フレーム $(printf "%04d" $((i+1))) (期間: $static_count フレーム < 最小: $min_frames フレーム)"
             fi
@@ -563,7 +573,7 @@ extract_static_frames() {
     if [[ -n "$static_start" && $static_count -ge $min_frames ]]; then
         local middle_frame_idx=$((static_start + static_count / 2))
         local source_frame="${frame_files[middle_frame_idx]}"
-        ((extracted_count++))
+        extracted_count=$((extracted_count + 1))
         local output_frame="$output_dir/${base_name}_$(printf '%04d' $extracted_count).png"
         
         cp "$source_frame" "$output_frame"
