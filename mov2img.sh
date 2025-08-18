@@ -18,6 +18,7 @@ DEFAULT_STATIC_DURATION="1.0"  # 静止判定の最小時間（秒）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMP_DIR="${SCRIPT_DIR}/temp"
 VERBOSE=false
+SKIP_EXTRACTION=false
 
 # ========================================
 # 終了時の後始末処理
@@ -47,6 +48,7 @@ usage() {
   -t, --threshold パーセント 差分閾値パーセント (省略時: 3%)
   -f, --fps レート          処理フレームレート (省略時: 30)
   -d, --duration 秒         静止判定の最小時間 (省略時: 1.0秒)
+  -s, --skip-extraction    フレーム抽出をスキップ (temp/の既存フレームを使用)
   -v, --verbose            詳細出力を有効にする
   -h, --help              この説明を表示
 
@@ -54,6 +56,7 @@ usage() {
   $0 -i recording.mov
   $0 -i recording.mp4 -o frames -n screenshot -t 5 -f 15
   $0 -i tutorial.mov -t 2 -d 0.5 -v
+  $0 -i recording.mov -s  # 既存フレームを使用して解析のみ実行
 EOF
 }
 
@@ -93,6 +96,10 @@ parse_args() {
             -d|--duration)
                 min_duration="$2"
                 shift 2
+                ;;
+            -s|--skip-extraction)
+                SKIP_EXTRACTION=true
+                shift
                 ;;
             -v|--verbose)
                 VERBOSE=true
@@ -357,33 +364,52 @@ extract_static_frames() {
     echo "========================================" >&2
     echo "" >&2
     
-    log "指定されたFPSでフレームを抽出中..."
-    
-    # ステップ1: 指定されたFPSでフレーム抽出（進捗表示付き）
-    echo "フレーム抽出を開始しています..." >&2
-    
-    # ffmpegをバックグラウンドで実行し、進捗を監視
-    ffmpeg -i "$input" \
-        -vf "fps=$fps" \
-        -q:v 2 \
-        -pix_fmt yuv420p \
-        -progress pipe:1 \
-        "$TEMP_DIR/frame_%08d.png" 2>/dev/null | \
-    while IFS='=' read -r key value; do
-        if [[ "$key" == "frame" ]]; then
-            # 現在のフレーム番号を取得
-            local current_frame="$value"
-            local progress_percent=$(echo "scale=1; $current_frame * 100 / $estimated_frames" | bc -l 2>/dev/null || echo "0")
-            
-            # 10フレームごとに進捗を更新
-            if [[ $((current_frame % 10)) -eq 0 ]]; then
-                echo -ne "\r抽出中: $current_frame / $estimated_frames フレーム (${progress_percent}%)" >&2
-            fi
+    # ステップ1: フレーム抽出またはスキップ
+    if [[ "$SKIP_EXTRACTION" == "true" ]]; then
+        # 既存フレームの確認
+        echo "フレーム抽出をスキップします..." >&2
+        echo "既存フレームを確認中..." >&2
+        
+        local existing_frames=($(ls "$TEMP_DIR"/frame_*.png 2>/dev/null | sort -V))
+        local existing_count=${#existing_frames[@]}
+        
+        if [[ $existing_count -eq 0 ]]; then
+            echo "エラー: $TEMP_DIR/ にフレームファイルが見つかりません" >&2
+            echo "先に -s オプションなしで実行してフレームを抽出してください" >&2
+            return 1
         fi
-    done
-    
-    echo -ne "\r" >&2
-    echo "フレーム抽出完了" >&2
+        
+        echo "既存フレーム数: $existing_count 枚" >&2
+        echo "" >&2
+    else
+        log "指定されたFPSでフレームを抽出中..."
+        
+        # フレーム抽出（進捗表示付き）
+        echo "フレーム抽出を開始しています..." >&2
+        
+        # ffmpegをバックグラウンドで実行し、進捗を監視
+        ffmpeg -i "$input" \
+            -vf "fps=$fps" \
+            -q:v 2 \
+            -pix_fmt yuv420p \
+            -progress pipe:1 \
+            "$TEMP_DIR/frame_%08d.png" 2>/dev/null | \
+        while IFS='=' read -r key value; do
+            if [[ "$key" == "frame" ]]; then
+                # 現在のフレーム番号を取得
+                local current_frame="$value"
+                local progress_percent=$(echo "scale=1; $current_frame * 100 / $estimated_frames" | bc -l 2>/dev/null || echo "0")
+                
+                # 10フレームごとに進捗を更新
+                if [[ $((current_frame % 10)) -eq 0 ]]; then
+                    echo -ne "\r抽出中: $current_frame / $estimated_frames フレーム (${progress_percent}%)" >&2
+                fi
+            fi
+        done
+        
+        echo -ne "\r" >&2
+        echo "フレーム抽出完了" >&2
+    fi
     
     # ステップ2: 抽出されたフレームの解析
     local frame_files=("$TEMP_DIR"/frame_*.png)
@@ -407,11 +433,53 @@ extract_static_frames() {
         local current_frame="${frame_files[i]}"
         local next_frame="${frame_files[i+1]}"
         
-        # ffmpegを使ってフレーム間の差分を計算
+        # フレームファイルの存在確認
+        if [[ ! -f "$current_frame" || ! -f "$next_frame" ]]; then
+            log "警告: フレームファイルが見つかりません: $current_frame または $next_frame"
+            continue
+        fi
+        
+        # エラー時の自動終了を一時的に無効化
+        set +e
+        
+        # ffmpegを使ってフレーム間の差分を計算（SSIM使用）
+        local ssim_output
+        ssim_output=$(ffmpeg -i "$current_frame" -i "$next_frame" \
+            -lavfi "ssim=stats_file=/dev/stdout" \
+            -f null - 2>&1 | grep "SSIM" | tail -1)
+        local ffmpeg_status=$?
+        
+        # エラー時の自動終了を再有効化
+        set -e
+        
+        # SSIM計算が失敗した場合のハンドリング
+        if [[ $ffmpeg_status -ne 0 || -z "$ssim_output" ]]; then
+            log "警告: SSIM計算に失敗しました。フレーム $((i+1)) → $((i+2)) (終了コード: $ffmpeg_status)"
+            continue
+        fi
+        
+        # SSIM値を抽出（1.0が完全一致、0.0が完全不一致）
+        local ssim_value
+        ssim_value=$(echo "$ssim_output" | grep -o "All:[0-9.]*" | cut -d: -f2 2>/dev/null)
+        
+        # 無効なSSIM値のチェック
+        if [[ -z "$ssim_value" ]]; then
+            log "警告: SSIM値の抽出に失敗しました: $ssim_output"
+            continue
+        fi
+        
+        # SSIM値を差分パーセンテージに変換（0%が完全一致、100%が完全不一致）
         local diff_score
-        diff_score=$(ffmpeg -i "$current_frame" -i "$next_frame" \
-            -filter_complex "[0:v][1:v]blend=all_mode=difference,blackframe=amount=0:threshold=32" \
-            -f null - 2>&1 | grep -o "blackframe.*" | head -1 | grep -o "pblack:[0-9.]*" | cut -d: -f2 || echo "0")
+        set +e
+        diff_score=$(echo "scale=2; (1 - $ssim_value) * 100" | bc -l 2>/dev/null)
+        local bc_status=$?
+        set -e
+        
+        # bc計算が失敗した場合のハンドリング
+        if [[ $bc_status -ne 0 || -z "$diff_score" ]]; then
+            log "警告: 差分スコア計算に失敗しました (SSIM値: $ssim_value)"
+            continue
+        fi
         
         # Verboseモードでは差分スコアを表示
         if [[ "$VERBOSE" == "true" ]]; then
@@ -421,7 +489,18 @@ extract_static_frames() {
         fi
         
         # 差分が閾値以下なら静止フレームと判定
-        if (( $(echo "$diff_score < $threshold" | bc -l) )); then
+        set +e
+        local comparison_result
+        comparison_result=$(echo "$diff_score < $threshold" | bc -l 2>/dev/null)
+        local comparison_status=$?
+        set -e
+        
+        if [[ $comparison_status -ne 0 ]]; then
+            log "警告: 閾値比較に失敗しました (差分: $diff_score, 閾値: $threshold)"
+            continue
+        fi
+        
+        if (( comparison_result )); then
             if [[ -z "$static_start" ]]; then
                 static_start="$i"
                 static_count=1
@@ -435,14 +514,34 @@ extract_static_frames() {
                 # 静止期間の中央フレームを抽出
                 local middle_frame_idx=$((static_start + static_count / 2))
                 local source_frame="${frame_files[middle_frame_idx]}"
-                local output_frame="$output_dir/${base_name}_$(printf '%04d' $((++extracted_count))).png"
                 
+                # ソースフレームの存在確認
+                if [[ ! -f "$source_frame" ]]; then
+                    log "エラー: ソースフレームが見つかりません: $source_frame"
+                    static_start=""
+                    static_count=0
+                    continue
+                fi
+                
+                ((extracted_count++))
+                local output_frame="$output_dir/${base_name}_$(printf '%04d' $extracted_count).png"
+                
+                # ファイルコピーをエラーハンドリング付きで実行
+                set +e
                 cp "$source_frame" "$output_frame"
-                log "静止画像を抽出: $output_frame (静止期間: $static_count フレーム)"
+                local cp_status=$?
+                set -e
                 
-                if [[ "$VERBOSE" == "true" ]]; then
-                    echo "  → 静止期間: フレーム $(printf "%04d" $((static_start+1))) から $(printf "%04d" $((i+1))) まで ($static_count フレーム)" >&2
-                    echo "  → 中央フレーム $(printf "%04d" $((middle_frame_idx+1))) を抽出" >&2
+                if [[ $cp_status -eq 0 ]]; then
+                    log "静止画像を抽出: $output_frame (静止期間: $static_count フレーム)"
+                    
+                    if [[ "$VERBOSE" == "true" ]]; then
+                        echo "  → 静止期間: フレーム $(printf "%04d" $((static_start+1))) から $(printf "%04d" $((i+1))) まで ($static_count フレーム)" >&2
+                        echo "  → 中央フレーム $(printf "%04d" $((middle_frame_idx+1))) を抽出" >&2
+                    fi
+                else
+                    log "エラー: ファイルコピーに失敗しました: $source_frame → $output_frame (終了コード: $cp_status)"
+                    ((extracted_count--))  # カウントを戻す
                 fi
             elif [[ -n "$static_start" ]]; then
                 log "静止期間終了: フレーム $(printf "%04d" $((i+1))) (期間: $static_count フレーム < 最小: $min_frames フレーム)"
@@ -464,10 +563,16 @@ extract_static_frames() {
     if [[ -n "$static_start" && $static_count -ge $min_frames ]]; then
         local middle_frame_idx=$((static_start + static_count / 2))
         local source_frame="${frame_files[middle_frame_idx]}"
-        local output_frame="$output_dir/${base_name}_$(printf '%04d' $((++extracted_count))).png"
+        ((extracted_count++))
+        local output_frame="$output_dir/${base_name}_$(printf '%04d' $extracted_count).png"
         
         cp "$source_frame" "$output_frame"
         log "最終静止画像を抽出: $output_frame"
+        
+        if [[ "$VERBOSE" == "true" ]]; then
+            echo "  → 最終静止期間: フレーム $(printf "%04d" $((static_start+1))) から $(printf "%04d" $total_frames) まで ($static_count フレーム)" >&2
+            echo "  → 中央フレーム $(printf "%04d" $((middle_frame_idx+1))) を抽出" >&2
+        fi
     fi
     
     echo -ne "\r" >&2
