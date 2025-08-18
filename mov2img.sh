@@ -382,6 +382,13 @@ extract_static_frames() {
         echo "既存フレーム数: $existing_count 枚" >&2
         echo "" >&2
     else
+        # 既存フレームファイルの削除
+        if [[ -d "$TEMP_DIR" ]]; then
+            echo "既存フレームファイルを削除中..." >&2
+            rm -f "$TEMP_DIR"/frame_*.png 2>/dev/null || true
+            log "TEMP_DIR内のフレームファイルを削除しました"
+        fi
+        
         log "指定されたFPSでフレームを抽出中..."
         
         # フレーム抽出（進捗表示付き）
