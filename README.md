@@ -132,3 +132,4 @@ Created by henoya
 
 - Built with `ffmpeg` for robust video processing
 - Inspired by the need for efficient documentation creation from screen recordings
+
